@@ -3,13 +3,13 @@ import time
 import math
 import threading
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import Mapping, Optional, List, Tuple
 
 import requests
 
 
 class ParallelResumableDownloader:
-    def _init_(
+    def __init__(
         self,
         num_workers: int = 4,
         chunk_size: int = 1024 * 1024,
@@ -32,16 +32,27 @@ class ParallelResumableDownloader:
 
     def download(self, url: str, output_path: str) -> None:
         output = Path(output_path)
-        temp_dir = output.parent / f"{output.name}.parts"
-        temp_dir.mkdir(parents=True, exist_ok=True)
+        output.parent.mkdir(parents=True, exist_ok=True)
 
         file_size, accepts_ranges = self._get_remote_file_info(url)
 
+        if file_size == 0:
+            output.write_bytes(b"")
+            with self._print_lock:
+                print(f"\n✅ Descarga completada: {output}")
+            return
+
         if not accepts_ranges:
-            raise RuntimeError(
-                "El servidor no soporta descargas parciales con Range. "
-                "Este descargador paralelo requiere soporte Range."
-            )
+            with self._print_lock:
+                print(
+                    "El servidor no soporta descargas parciales con Range. "
+                    "Se usara descarga secuencial."
+                )
+            self._download_single(url, output, file_size)
+            return
+
+        temp_dir = output.parent / f"{output.name}.parts"
+        temp_dir.mkdir(parents=True, exist_ok=True)
 
         ranges = self._split_ranges(file_size, self.num_workers)
         part_files = [temp_dir / f"part_{i}.bin" for i in range(len(ranges))]
@@ -86,56 +97,142 @@ class ParallelResumableDownloader:
         with self._print_lock:
             print(f"\n✅ Descarga completada: {output}")
 
+    def _download_single(self, url: str, output: Path, file_size: int) -> None:
+        temp_output = output.with_suffix(output.suffix + ".partial")
+        retries = 0
+
+        while True:
+            downloaded = 0
+
+            try:
+                if temp_output.exists():
+                    temp_output.unlink()
+
+                with requests.get(
+                    url,
+                    headers=self.headers,
+                    stream=True,
+                    timeout=self.timeout,
+                ) as response:
+                    if response.status_code >= 400:
+                        raise RuntimeError(
+                            f"El servidor rechazo la descarga secuencial. HTTP {response.status_code}"
+                        )
+
+                    with open(temp_output, "wb") as f:
+                        for chunk in response.iter_content(chunk_size=self.chunk_size):
+                            if not chunk:
+                                continue
+
+                            f.write(chunk)
+                            f.flush()
+                            os.fsync(f.fileno())
+
+                            downloaded += len(chunk)
+                            percent = downloaded * 100 / file_size if file_size else 0
+
+                            with self._print_lock:
+                                print(
+                                    f"\rDescargado total: {downloaded}/{file_size} bytes "
+                                    f"({percent:5.1f}%)",
+                                    end="",
+                                    flush=True,
+                                )
+
+                temp_output.replace(output)
+
+                with self._print_lock:
+                    print(f"\n✅ Descarga completada: {output}")
+
+                return
+
+            except KeyboardInterrupt:
+                raise
+
+            except (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.ChunkedEncodingError,
+                OSError,
+                RuntimeError,
+            ) as e:
+                retries += 1
+
+                if self.max_retries_per_worker is not None and retries > self.max_retries_per_worker:
+                    raise RuntimeError(f"Fallo en la descarga secuencial: {e}") from e
+
+                wait = min(self.retry_wait_seconds * (2 ** (retries - 1)), 300)
+
+                with self._print_lock:
+                    print(
+                        f"\n⚠️ Descarga secuencial falló: {e} | "
+                        f"reintento {retries} en {wait}s"
+                    )
+
+                time.sleep(wait)
+
     def _get_remote_file_info(self, url: str) -> Tuple[int, bool]:
         with requests.Session() as session:
             session.headers.update(self.headers)
 
-            response = session.head(url, allow_redirects=True, timeout=self.timeout)
-            if response.status_code >= 400:
-                response = session.get(
-                    url,
-                    headers={"Range": "bytes=0-0", **self.headers},
-                    stream=True,
-                    timeout=self.timeout,
-                )
+            response_headers: Mapping[str, str] = {}
+            response_status = None
 
-            content_length = response.headers.get("Content-Length")
-            content_range = response.headers.get("Content-Range")
-            accept_ranges = response.headers.get("Accept-Ranges", "").lower()
+            try:
+                with session.head(url, allow_redirects=True, timeout=self.timeout) as response:
+                    response_status = response.status_code
+                    response_headers = response.headers
+            except requests.RequestException:
+                pass
 
-            file_size = None
-
-            if content_range and "/" in content_range:
-                try:
-                    file_size = int(content_range.split("/")[-1])
-                except ValueError:
-                    pass
-
-            if file_size is None and content_length:
-                try:
-                    file_size = int(content_length)
-                except ValueError:
-                    pass
-
-            if file_size is None:
-                raise RuntimeError("No se pudo determinar el tamaño del archivo remoto.")
-
+            file_size = self._extract_remote_file_size(response_headers)
+            accept_ranges = response_headers.get("Accept-Ranges", "").lower()
             supports_range = (
                 "bytes" in accept_ranges
-                or response.status_code == 206
-                or response.headers.get("Content-Range") is not None
+                or response_status == 206
+                or response_headers.get("Content-Range") is not None
             )
 
-            test = session.get(
+            with session.get(
                 url,
                 headers={"Range": "bytes=0-0", **self.headers},
                 stream=True,
                 timeout=self.timeout,
-            )
-            if test.status_code == 206:
-                supports_range = True
+            ) as probe_response:
+                if probe_response.status_code >= 400 and file_size is None:
+                    raise RuntimeError(
+                        f"No se pudo consultar el archivo remoto. HTTP {probe_response.status_code}"
+                    )
+
+                if file_size is None:
+                    file_size = self._extract_remote_file_size(probe_response.headers)
+
+                if probe_response.status_code == 206:
+                    supports_range = True
+
+            if file_size is None:
+                raise RuntimeError("No se pudo determinar el tamaño del archivo remoto.")
 
             return file_size, supports_range
+
+    @staticmethod
+    def _extract_remote_file_size(headers: Mapping[str, str]) -> Optional[int]:
+        content_length = headers.get("Content-Length")
+        content_range = headers.get("Content-Range")
+
+        if content_range and "/" in content_range:
+            try:
+                return int(content_range.split("/")[-1])
+            except ValueError:
+                pass
+
+        if content_length:
+            try:
+                return int(content_length)
+            except ValueError:
+                pass
+
+        return None
 
     @staticmethod
     def _split_ranges(file_size: int, workers: int) -> List[Tuple[int, int]]:
@@ -300,7 +397,7 @@ class ParallelResumableDownloader:
             temp_dir.rmdir()
 
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     url = "https://ejemplo.com/archivo_grande.zip"
     destino = "archivo_grande.zip"
 
